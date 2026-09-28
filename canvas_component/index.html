@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #17231f; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #fff; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 0 0 9px; }
+    button, select, input { min-height: 32px; border: 1px solid #cbd5d1; border-radius: 4px; background: #fff; color: #17231f; font: inherit; }
+    button { padding: 0 11px; cursor: pointer; }
+    button.active { border-color: #0f766e; background: #e8f5f2; color: #0f514c; }
+    select, input { padding: 0 8px; }
+    input { width: 88px; }
+    .option { display: none; align-items: center; gap: 6px; font-size: 13px; }
+    .option.visible { display: flex; }
+    #status { flex: 1 0 100%; min-height: 17px; color: #52635d; font-size: 12px; }
+    canvas { display: block; width: 100%; max-width: 800px; height: auto; border: 1px solid #b8c6c0; border-radius: 3px; cursor: crosshair; touch-action: manipulation; }
+  </style>
+</head>
+<body>
+  <div class="toolbar" aria-label="Herramientas de edición">
+    <button type="button" data-mode="nodo" class="active">Nodo</button>
+    <button type="button" data-mode="barra">Barra</button>
+    <button type="button" data-mode="apoyo">Apoyo</button>
+    <button type="button" data-mode="carga">Carga puntual</button>
+    <label id="support-option" class="option">Tipo
+      <select id="support-type"><option value="fijo">Fijo</option><option value="movil">Móvil</option></select>
+    </label>
+    <label id="load-option" class="option">Dirección
+      <select id="load-direction">
+        <option value="fy-">Fy hacia abajo</option><option value="fy+">Fy hacia arriba</option>
+        <option value="fx+">Fx a la derecha</option><option value="fx-">Fx a la izquierda</option>
+      </select>
+    </label>
+    <label id="magnitude-option" class="option">Magnitud
+      <input id="load-magnitude" type="number" min="0" step="any" value="1000" aria-label="Magnitud de carga">
+    </label>
+    <div id="status" role="status">Haz clic en la cuadrícula para agregar nodos. Ajuste: 1 unidad.</div>
+  </div>
+  <canvas id="drawing" width="800" height="500" aria-label="Lienzo de estructura de 800 por 500 píxeles"></canvas>
+  <script>
+    const canvas = document.getElementById("drawing");
+    const ctx = canvas.getContext("2d");
+    const status = document.getElementById("status");
+    const buttons = [...document.querySelectorAll("[data-mode]")];
+    const supportOption = document.getElementById("support-option");
+    const loadOption = document.getElementById("load-option");
+    const magnitudeOption = document.getElementById("magnitude-option");
+    const plot = { left: 48, right: 20, top: 18, bottom: 34 };
+    let mode = "nodo";
+    let nodes = [];
+    let elements = [];
+    let supports = [];
+    let loads = [];
+    let view = null;
+    let firstNode = null;
+    let args = {};
+    let eventCounter = 0;
+
+    const number = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return value !== null && value !== "" && Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const validNodes = () => nodes.filter(row => Number.isFinite(Number(row.Nodo)) && Number.isFinite(Number(row.X)) && Number.isFinite(Number(row.Y)));
+    const dimensions = () => ({ width: canvas.width - plot.left - plot.right, height: canvas.height - plot.top - plot.bottom });
+
+    function fitView(rows) {
+      const points = rows.map(row => ({ x: Number(row.X), y: Number(row.Y) }));
+      let minX = points.length ? Math.min(...points.map(point => point.x)) : -4;
+      let maxX = points.length ? Math.max(...points.map(point => point.x)) : 4;
+      let minY = points.length ? Math.min(...points.map(point => point.y)) : -2.5;
+      let maxY = points.length ? Math.max(...points.map(point => point.y)) : 2.5;
+      const padX = Math.max((maxX - minX) * 0.25, 1);
+      const padY = Math.max((maxY - minY) * 0.25, 1);
+      minX -= padX; maxX += padX; minY -= padY; maxY += padY;
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      let spanX = Math.max(maxX - minX, 8);
+      let spanY = Math.max(maxY - minY, 5);
+      const size = dimensions();
+      const ratio = size.width / size.height;
+      if (spanX / spanY < ratio) spanX = spanY * ratio;
+      else spanY = spanX / ratio;
+      return { minX: centerX - spanX / 2, maxX: centerX + spanX / 2, minY: centerY - spanY / 2, maxY: centerY + spanY / 2 };
+    }
+
+    function toPixel(x, y) {
+      const size = dimensions();
+      return {
+        x: plot.left + (x - view.minX) / (view.maxX - view.minX) * size.width,
+        y: plot.top + (view.maxY - y) / (view.maxY - view.minY) * size.height,
+      };
+    }
+
+    function toWorld(x, y) {
+      const size = dimensions();
+      return {
+        x: view.minX + (x - plot.left) / size.width * (view.maxX - view.minX),
+        y: view.maxY - (y - plot.top) / size.height * (view.maxY - view.minY),
+      };
+    }
+
+    function drawGrid() {
+      const size = dimensions();
+      const span = Math.max(view.maxX - view.minX, view.maxY - view.minY);
+      const interval = 10 ** Math.floor(Math.log10(Math.max(span / 35, 1)));
+      const startX = Math.ceil(view.minX / interval) * interval;
+      const startY = Math.ceil(view.minY / interval) * interval;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(plot.left, plot.top, size.width, size.height); ctx.clip();
+      ctx.strokeStyle = "#e5ebe8"; ctx.lineWidth = 1;
+      for (let x = startX; x <= view.maxX; x += interval) {
+        const point = toPixel(x, 0);
+        ctx.beginPath(); ctx.moveTo(point.x, plot.top); ctx.lineTo(point.x, canvas.height - plot.bottom); ctx.stroke();
+      }
+      for (let y = startY; y <= view.maxY; y += interval) {
+        const point = toPixel(0, y);
+        ctx.beginPath(); ctx.moveTo(plot.left, point.y); ctx.lineTo(canvas.width - plot.right, point.y); ctx.stroke();
+      }
+      ctx.restore();
+      ctx.fillStyle = "#52635d"; ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "center";
+      for (let x = startX; x <= view.maxX; x += interval) {
+        const point = toPixel(x, 0);
+        ctx.fillText(Number(x.toPrecision(5)).toString(), point.x, canvas.height - 12);
+      }
+      ctx.textAlign = "right";
+      for (let y = startY; y <= view.maxY; y += interval) {
+        const point = toPixel(0, y);
+        ctx.fillText(Number(y.toPrecision(5)).toString(), plot.left - 7, point.y + 4);
+      }
+    }
+
+    function drawArrow(from, to, color) {
+      const angle = Math.atan2(to.y - from.y, to.x - from.x);
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(to.x, to.y);
+      ctx.lineTo(to.x - 9 * Math.cos(angle - Math.PI / 6), to.y - 9 * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(to.x - 9 * Math.cos(angle + Math.PI / 6), to.y - 9 * Math.sin(angle + Math.PI / 6));
+      ctx.closePath(); ctx.fill();
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#fbfcfb"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      drawGrid();
+      const nodeById = new Map(validNodes().map(row => [Number(row.Nodo), row]));
+      ctx.lineWidth = 2.5; ctx.strokeStyle = "#147d72";
+      elements.forEach(row => {
+        const a = nodeById.get(Number(row.Nodo_i));
+        const b = nodeById.get(Number(row.Nodo_j));
+        if (!a || !b) return;
+        const p1 = toPixel(Number(a.X), Number(a.Y)); const p2 = toPixel(Number(b.X), Number(b.Y));
+        ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+        const midpoint = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 - 8 };
+        ctx.fillStyle = "#26352f"; ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center";
+        ctx.fillText(`B${row.Barra}`, midpoint.x, midpoint.y);
+      });
+      supports.forEach(row => {
+        const node = nodeById.get(Number(row.Nodo));
+        if (!node) return;
+        const point = toPixel(Number(node.X), Number(node.Y));
+        ctx.strokeStyle = "#34453e"; ctx.fillStyle = "#dce9e4"; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        if (number(row.Ux) === 0 && number(row.Uy) === 0) {
+          ctx.moveTo(point.x - 11, point.y + 14); ctx.lineTo(point.x + 11, point.y + 14); ctx.lineTo(point.x, point.y + 1);
+        } else {
+          ctx.arc(point.x, point.y + 8, 8, 0, Math.PI * 2);
+        }
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      });
+      loads.forEach(row => {
+        const node = nodeById.get(Number(row.Nodo));
+        if (!node) return;
+        const point = toPixel(Number(node.X), Number(node.Y));
+        const fx = number(row.Fx); const fy = number(row.Fy);
+        const scale = 28 / Math.max(Math.abs(fx), Math.abs(fy), 1);
+        if (fx || fy) drawArrow({ x: point.x - fx * scale, y: point.y + fy * scale }, point, "#c45b24");
+      });
+      validNodes().forEach(row => {
+        const point = toPixel(Number(row.X), Number(row.Y));
+        ctx.beginPath(); ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = "#c7473b"; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = "#26352f"; ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "left";
+        ctx.fillText(String(row.Nodo), point.x + 9, point.y - 8);
+        const dofX = 2 * Number(row.Nodo) - 1;
+        const dofY = dofX + 1;
+        drawArrow({ x: point.x + 4, y: point.y + 11 }, { x: point.x + 22, y: point.y + 11 }, "#2563eb");
+        ctx.fillStyle = "#1d4ed8"; ctx.font = "10px system-ui, sans-serif"; ctx.textAlign = "left";
+        ctx.fillText(`g${dofX} · +X`, point.x + 25, point.y + 14);
+        drawArrow({ x: point.x - 9, y: point.y - 3 }, { x: point.x - 9, y: point.y - 22 }, "#059669");
+        ctx.fillStyle = "#047857"; ctx.textAlign = "center";
+        ctx.fillText(`g${dofY} · +Y`, point.x - 9, point.y - 27);
+      });
+    }
+
+    function postUpdate() {
+      eventCounter += 1;
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: { event_id: `${Date.now()}-${eventCounter}`, nodes, elements, supports, loads },
+      }, "*");
+    }
+
+    function nearestNode(x, y) {
+      let found = null; let distance = 18;
+      validNodes().forEach(row => {
+        const point = toPixel(Number(row.X), Number(row.Y));
+        const current = Math.hypot(point.x - x, point.y - y);
+        if (current < distance) { found = row; distance = current; }
+      });
+      return found;
+    }
+
+    function setMode(nextMode) {
+      mode = nextMode; firstNode = null;
+      buttons.forEach(button => button.classList.toggle("active", button.dataset.mode === mode));
+      supportOption.classList.toggle("visible", mode === "apoyo");
+      loadOption.classList.toggle("visible", mode === "carga");
+      magnitudeOption.classList.toggle("visible", mode === "carga");
+      const messages = { nodo: "Haz clic en la cuadrícula para agregar nodos. Ajuste: 1 unidad.", barra: "Selecciona dos nodos, uno después del otro, para crear una barra.", apoyo: "Selecciona un nodo para asignarle el apoyo elegido.", carga: "Selecciona un nodo para aplicar la carga puntual indicada." };
+      status.textContent = messages[mode];
+    }
+
+    buttons.forEach(button => button.addEventListener("click", () => setMode(button.dataset.mode)));
+
+    canvas.addEventListener("click", event => {
+      const rect = canvas.getBoundingClientRect();
+      const x = (event.clientX - rect.left) * canvas.width / rect.width;
+      const y = (event.clientY - rect.top) * canvas.height / rect.height;
+      if (x < plot.left || x > canvas.width - plot.right || y < plot.top || y > canvas.height - plot.bottom) return;
+      const selected = nearestNode(x, y);
+
+      if (mode === "nodo") {
+        if (selected) return;
+        const world = toWorld(x, y);
+        const id = Math.max(0, ...validNodes().map(row => Number(row.Nodo))) + 1;
+        nodes = [...nodes, { Nodo: id, X: Math.round(world.x), Y: Math.round(world.y) }];
+        if (view && (world.x < view.minX || world.x > view.maxX || world.y < view.minY || world.y > view.maxY)) view = fitView(validNodes());
+        draw(); postUpdate();
+        return;
+      }
+      if (!selected) return;
+      const nodeId = Number(selected.Nodo);
+      if (mode === "barra") {
+        if (firstNode === null) {
+          firstNode = nodeId; status.textContent = `Nodo ${nodeId} seleccionado. Elige el segundo nodo.`; return;
+        }
+        if (firstNode === nodeId) { firstNode = null; status.textContent = "Elige un segundo nodo distinto."; return; }
+        const exists = elements.some(row => (Number(row.Nodo_i) === firstNode && Number(row.Nodo_j) === nodeId) || (Number(row.Nodo_i) === nodeId && Number(row.Nodo_j) === firstNode));
+        if (!exists) {
+          const id = Math.max(0, ...elements.map(row => number(row.Barra))) + 1;
+          elements = [...elements, { Barra: id, Nodo_i: firstNode, Nodo_j: nodeId, E: number(args.default_e, 210e9), A: number(args.default_a, 0.005) }];
+          draw(); postUpdate();
+        }
+        firstNode = null; status.textContent = exists ? "Esa barra ya existe." : `Barra ${elements[elements.length - 1].Barra} creada.`;
+      } else if (mode === "apoyo") {
+        const fixed = document.getElementById("support-type").value === "fijo";
+        supports = supports.filter(row => Number(row.Nodo) !== nodeId);
+        supports.push({ Nodo: nodeId, Ux: fixed ? 0 : 1, Uy: 0 });
+        draw(); postUpdate(); status.textContent = `${fixed ? "Apoyo fijo" : "Apoyo móvil"} asignado al nodo ${nodeId}.`;
+      } else if (mode === "carga") {
+        const magnitude = Math.abs(number(document.getElementById("load-magnitude").value));
+        const direction = document.getElementById("load-direction").value;
+        const load = loads.find(row => Number(row.Nodo) === nodeId) || { Nodo: nodeId, Fx: 0, Fy: 0 };
+        if (direction.startsWith("fx")) load.Fx = number(load.Fx) + (direction.endsWith("+") ? magnitude : -magnitude);
+        else load.Fy = number(load.Fy) + (direction.endsWith("+") ? magnitude : -magnitude);
+        loads = loads.filter(row => Number(row.Nodo) !== nodeId).concat(load);
+        draw(); postUpdate(); status.textContent = `Carga aplicada al nodo ${nodeId}.`;
+      }
+    });
+
+    function receiveRender(message) {
+      if (!message || message.type !== "streamlit:render" || !message.args) return;
+      args = message.args;
+      nodes = Array.isArray(args.nodes) ? args.nodes.map(row => ({ ...row })) : [];
+      elements = Array.isArray(args.elements) ? args.elements.map(row => ({ ...row })) : [];
+      supports = Array.isArray(args.supports) ? args.supports.map(row => ({ ...row })) : [];
+      loads = Array.isArray(args.loads) ? args.loads.map(row => ({ ...row })) : [];
+      const rows = validNodes();
+      if (!view || rows.some(row => Number(row.X) < view.minX || Number(row.X) > view.maxX || Number(row.Y) < view.minY || Number(row.Y) > view.maxY)) view = fitView(rows);
+      draw();
+      status.textContent = `Cuadrícula: 1 ${args.length_unit || "unidad"}. Coordenadas ajustadas a enteros.`;
+    }
+
+    window.addEventListener("message", event => receiveRender(event.data));
+    const resizeObserver = new ResizeObserver(() => {
+      const height = Math.ceil(document.querySelector(".toolbar").getBoundingClientRect().height + canvas.getBoundingClientRect().height + 8);
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height }, "*");
+    });
+    resizeObserver.observe(document.body);
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+  </script>
+</body>
+</html>

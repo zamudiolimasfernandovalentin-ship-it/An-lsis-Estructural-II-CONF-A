@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, List
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from examples import ejercicio_1
 from reports import export_analysis_excel, generate_pdf_report
-from structural_solver import Truss2D, parse_distributed_loads_from_df, parse_elements_from_df, parse_loads_from_df, parse_nodes_from_df, parse_supports_from_df, validate_exercise_1
+from structural_solver import Truss2D, format_number, parse_distributed_loads_from_df, parse_elements_from_df, parse_loads_from_df, parse_nodes_from_df, parse_numeric_expression, parse_supports_from_df, validate_exercise_1
 
 
 st.set_page_config(page_title="Análisis Estructural II – Método de Rigidez", layout="wide")
 
 FORCE_TO_NEWTONS = {"tonf": 9806.65, "kgf": 9.80665, "kN": 1000.0, "N": 1.0}
 LENGTH_TO_METERS = {"m": 1.0, "cm": 0.01, "mm": 0.001}
-EDITOR_KEYS = ("nodes_editor", "elements_editor", "supports_editor", "loads_editor", "distributed_loads_editor")
+EXPRESSION_HELP = "Admite expresiones como 2*sqrt(3), 2raiz(3), 10^6, 2x10^6 y fracciones."
+EDITOR_KEYS = ("tabla_nodos", "tabla_barras", "tabla_apoyos", "tabla_cargas", "tabla_cargas_distribuidas")
+structural_canvas = components.declare_component(
+    "structural_canvas", path=str(Path(__file__).parent / "canvas_component")
+)
 
 
 def as_dataframe(rows: Any, columns: List[str]) -> pd.DataFrame:
@@ -40,6 +47,51 @@ def as_dataframe(rows: Any, columns: List[str]) -> pd.DataFrame:
             return pd.DataFrame(rows, columns=columns)
         return pd.DataFrame([rows], columns=columns)
     return pd.DataFrame([rows], columns=columns)
+
+
+def parse_numeric_columns(frame: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    parsed = frame.copy()
+    for column in columns:
+        if column in parsed:
+            parsed[column] = parsed[column].map(
+                lambda value: np.nan if pd.isna(value) else parse_numeric_expression(value)
+            )
+    return parsed
+
+
+def parse_numeric_for_display(value: Any) -> float:
+    try:
+        return parse_numeric_expression(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def numeric_columns_for_display(frame: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    parsed = frame.copy()
+    for column in columns:
+        if column in parsed:
+            parsed[column] = parsed[column].map(parse_numeric_for_display)
+    return parsed
+
+
+def expression_editor_frame(frame: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    editable = frame.copy()
+    for column in columns:
+        if column in editable:
+            editable[column] = editable[column].map(
+                lambda value: "" if pd.isna(value) else str(value)
+            ).astype(object)
+    return editable
+
+
+def format_dataframe(frame: pd.DataFrame, signed_columns: List[str] | None = None) -> pd.io.formats.style.Styler:
+    signed_columns = signed_columns or []
+    formatters = {
+        column: (lambda value, signed=column in signed_columns: format_number(value, signed=signed))
+        for column in frame.columns
+        if pd.api.types.is_numeric_dtype(frame[column])
+    }
+    return frame.style.format(formatters, na_rep="—", precision=4)
 
 
 def initialize_state() -> None:
@@ -80,6 +132,34 @@ def initialize_state() -> None:
 def clear_editor_widget_state() -> None:
     for key in (*EDITOR_KEYS, "structure_plot"):
         st.session_state.pop(key, None)
+
+
+def apply_data_editor_state(frame: pd.DataFrame, editor_state: Any) -> pd.DataFrame:
+    if isinstance(editor_state, pd.DataFrame):
+        return editor_state.copy()
+    if not isinstance(editor_state, dict):
+        return frame.copy()
+
+    updated = frame.copy().reset_index(drop=True)
+    for row_key, changes in editor_state.get("edited_rows", {}).items():
+        row_index = int(row_key)
+        if not 0 <= row_index < len(updated):
+            continue
+        for column, value in changes.items():
+            if column in updated.columns:
+                updated.at[row_index, column] = value
+
+    deleted_rows = sorted({int(index) for index in editor_state.get("deleted_rows", [])}, reverse=True)
+    for row_index in deleted_rows:
+        if 0 <= row_index < len(updated):
+            updated = updated.drop(index=row_index)
+    updated = updated.reset_index(drop=True)
+
+    added_rows = editor_state.get("added_rows", [])
+    if added_rows:
+        additions = pd.DataFrame(added_rows).reindex(columns=updated.columns)
+        updated = pd.concat([updated, additions], ignore_index=True)
+    return updated
 
 
 def load_selected_exercise() -> None:
@@ -127,27 +207,35 @@ def change_units() -> None:
     old_length = LENGTH_TO_METERS[st.session_state.current_length_unit]
     new_length = LENGTH_TO_METERS[st.session_state.length_unit]
 
-    for column in ("Fx", "Fy"):
-        if column in st.session_state.loads_df:
-            st.session_state.loads_df[column] = pd.to_numeric(st.session_state.loads_df[column], errors="coerce") * old_force / new_force
-    for column in ("X", "Y"):
-        if column in st.session_state.nodes_df:
-            st.session_state.nodes_df[column] = pd.to_numeric(st.session_state.nodes_df[column], errors="coerce") * old_length / new_length
-    if "A" in st.session_state.elements_df:
-        st.session_state.elements_df["A"] = pd.to_numeric(st.session_state.elements_df["A"], errors="coerce") * old_length**2 / new_length**2
-    if "E" in st.session_state.elements_df:
-        st.session_state.elements_df["E"] = (
-            pd.to_numeric(st.session_state.elements_df["E"], errors="coerce")
-            * (old_force / old_length**2)
-            / (new_force / new_length**2)
-        )
-    for column in ("q_i", "q_j"):
-        if column in st.session_state.distributed_loads_df:
-            st.session_state.distributed_loads_df[column] = (
-                pd.to_numeric(st.session_state.distributed_loads_df[column], errors="coerce")
-                * (old_force / old_length) / (new_force / new_length)
-            )
+    try:
+        loads = parse_numeric_columns(st.session_state.loads_df, ["Fx", "Fy"])
+        nodes = parse_numeric_columns(st.session_state.nodes_df, ["X", "Y"])
+        elements = parse_numeric_columns(st.session_state.elements_df, ["E", "A"])
+        distributed_loads = parse_numeric_columns(st.session_state.distributed_loads_df, ["q_i", "q_j"])
+    except ValueError as exc:
+        st.session_state.force_unit = st.session_state.current_force_unit
+        st.session_state.length_unit = st.session_state.current_length_unit
+        st.session_state.solution_error = str(exc)
+        return
 
+    for column in ("Fx", "Fy"):
+        if column in loads:
+            loads[column] = loads[column] * old_force / new_force
+    for column in ("X", "Y"):
+        if column in nodes:
+            nodes[column] = nodes[column] * old_length / new_length
+    if "A" in elements:
+        elements["A"] = elements["A"] * old_length**2 / new_length**2
+    if "E" in elements:
+        elements["E"] = elements["E"] * (old_force / old_length**2) / (new_force / new_length**2)
+    for column in ("q_i", "q_j"):
+        if column in distributed_loads:
+            distributed_loads[column] = distributed_loads[column] * (old_force / old_length) / (new_force / new_length)
+
+    st.session_state.loads_df = loads
+    st.session_state.nodes_df = nodes
+    st.session_state.elements_df = elements
+    st.session_state.distributed_loads_df = distributed_loads
     st.session_state.current_force_unit = st.session_state.force_unit
     st.session_state.current_length_unit = st.session_state.length_unit
     st.session_state.solution = None
@@ -158,20 +246,20 @@ def change_units() -> None:
 def current_inputs_in_si() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
     length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
-    nodes = st.session_state.nodes_df.copy()
-    elements = st.session_state.elements_df.copy()
+    nodes = parse_numeric_columns(st.session_state.nodes_df, ["X", "Y"])
+    elements = parse_numeric_columns(st.session_state.elements_df, ["E", "A"])
     supports = st.session_state.supports_df.copy()
-    loads = st.session_state.loads_df.copy()
-    distributed_loads = st.session_state.distributed_loads_df.copy()
+    loads = parse_numeric_columns(st.session_state.loads_df, ["Fx", "Fy"])
+    distributed_loads = parse_numeric_columns(st.session_state.distributed_loads_df, ["q_i", "q_j"])
 
     for column in ("X", "Y"):
-        nodes[column] = pd.to_numeric(nodes[column], errors="coerce") * length_factor
-    elements["E"] = pd.to_numeric(elements["E"], errors="coerce") * force_factor / length_factor**2
-    elements["A"] = pd.to_numeric(elements["A"], errors="coerce") * length_factor**2
+        nodes[column] = nodes[column] * length_factor
+    elements["E"] = elements["E"] * force_factor / length_factor**2
+    elements["A"] = elements["A"] * length_factor**2
     for column in ("Fx", "Fy"):
-        loads[column] = pd.to_numeric(loads[column], errors="coerce") * force_factor
+        loads[column] = loads[column] * force_factor
     for column in ("q_i", "q_j"):
-        distributed_loads[column] = pd.to_numeric(distributed_loads[column], errors="coerce") * force_factor / length_factor
+        distributed_loads[column] = distributed_loads[column] * force_factor / length_factor
     return nodes, elements, supports, loads, distributed_loads
 
 
@@ -215,26 +303,95 @@ def mark_structure_changed() -> None:
     st.session_state.solution = None
 
 
+def sync_editor_dataframe(editor_key: str, dataframe_key: str) -> None:
+    edited_frame = st.session_state.get(editor_key)
+    current_frame = st.session_state.get(dataframe_key)
+    if isinstance(current_frame, pd.DataFrame):
+        st.session_state[dataframe_key] = apply_data_editor_state(current_frame, edited_frame)
+    st.session_state.pop(editor_key, None)
+    st.session_state.solution = None
+
+
+def render_structure_canvas() -> None:
+    force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
+    length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
+    existing_elements = st.session_state.elements_df
+    valid_elements = existing_elements.dropna(subset=["E", "A"]) if not existing_elements.empty else existing_elements
+    default_e = parse_numeric_for_display(valid_elements.iloc[0]["E"]) if not valid_elements.empty else np.nan
+    default_a = parse_numeric_for_display(valid_elements.iloc[0]["A"]) if not valid_elements.empty else np.nan
+    if not np.isfinite(default_e) or default_e <= 0:
+        default_e = 210e9 / (force_factor / length_factor**2)
+    if not np.isfinite(default_a) or default_a <= 0:
+        default_a = 5e-3 / length_factor**2
+    canvas_nodes = numeric_columns_for_display(st.session_state.nodes_df, ["Nodo", "X", "Y"])
+    canvas_elements = numeric_columns_for_display(st.session_state.elements_df, ["Barra", "Nodo_i", "Nodo_j", "E", "A"])
+    canvas_supports = numeric_columns_for_display(st.session_state.supports_df, ["Nodo", "Ux", "Uy"])
+    canvas_loads = numeric_columns_for_display(st.session_state.loads_df, ["Nodo", "Fx", "Fy"])
+    event = structural_canvas(
+        nodes=json.loads(canvas_nodes.to_json(orient="records")),
+        elements=json.loads(canvas_elements.to_json(orient="records")),
+        supports=json.loads(canvas_supports.to_json(orient="records")),
+        loads=json.loads(canvas_loads.to_json(orient="records")),
+        default_e=default_e,
+        default_a=default_a,
+        length_unit=st.session_state.length_unit,
+        force_unit=st.session_state.force_unit,
+        key="structure_canvas",
+        default=None,
+    )
+    if not isinstance(event, dict) or event.get("event_id") == st.session_state.get("canvas_last_event_id"):
+        return
+
+    st.session_state.canvas_last_event_id = event.get("event_id")
+    updated_nodes = as_dataframe(event.get("nodes"), ["Nodo", "X", "Y"])
+    for column in ("X", "Y"):
+        updated_nodes[column] = pd.to_numeric(updated_nodes[column], errors="coerce").astype(float)
+    st.session_state.nodes_df = updated_nodes
+    st.session_state.elements_df = as_dataframe(event.get("elements"), ["Barra", "Nodo_i", "Nodo_j", "E", "A"])
+    st.session_state.supports_df = as_dataframe(event.get("supports"), ["Nodo", "Ux", "Uy"])
+    st.session_state.loads_df = as_dataframe(event.get("loads"), ["Nodo", "Fx", "Fy"])
+    st.session_state.solution = None
+    st.session_state.solution_error = None
+    clear_editor_widget_state()
+    st.rerun()
+
+
 def render_data_editors() -> None:
     st.subheader("Nodos")
     st.session_state.nodes_df = st.data_editor(
-        st.session_state.nodes_df, key="nodes_editor", num_rows="dynamic", width="stretch",
-        on_change=mark_structure_changed,
+        expression_editor_frame(st.session_state.nodes_df, ["X", "Y"]), key="tabla_nodos", num_rows="dynamic", width="stretch",
+        column_config={
+            "X": st.column_config.TextColumn(f"X ({st.session_state.length_unit})", help=EXPRESSION_HELP),
+            "Y": st.column_config.TextColumn(f"Y ({st.session_state.length_unit})", help=EXPRESSION_HELP),
+        },
+        on_change=sync_editor_dataframe, args=("tabla_nodos", "nodes_df"),
     )
     st.subheader("Barras y propiedades")
     st.session_state.elements_df = st.data_editor(
-        st.session_state.elements_df, key="elements_editor", num_rows="dynamic", width="stretch",
-        on_change=mark_structure_changed,
+        expression_editor_frame(st.session_state.elements_df, ["E", "A"]), key="tabla_barras", num_rows="dynamic", width="stretch",
+        column_config={
+            "E": st.column_config.TextColumn(f"E ({st.session_state.force_unit}/{st.session_state.length_unit}²)", help=EXPRESSION_HELP),
+            "A": st.column_config.TextColumn(f"A ({st.session_state.length_unit}²)", help=EXPRESSION_HELP),
+        },
+        on_change=sync_editor_dataframe, args=("tabla_barras", "elements_df"),
     )
     st.subheader("Apoyos")
     st.session_state.supports_df = st.data_editor(
-        st.session_state.supports_df, key="supports_editor", num_rows="dynamic", width="stretch",
-        on_change=mark_structure_changed,
+        expression_editor_frame(st.session_state.supports_df, ["Ux", "Uy"]), key="tabla_apoyos", num_rows="dynamic", width="stretch",
+        column_config={
+            "Ux": st.column_config.TextColumn("Ux (0=restringido, 1=libre)", help=EXPRESSION_HELP),
+            "Uy": st.column_config.TextColumn("Uy (0=restringido, 1=libre)", help=EXPRESSION_HELP),
+        },
+        on_change=sync_editor_dataframe, args=("tabla_apoyos", "supports_df"),
     )
     st.subheader("Cargas")
     st.session_state.loads_df = st.data_editor(
-        st.session_state.loads_df, key="loads_editor", num_rows="dynamic", width="stretch",
-        on_change=mark_structure_changed,
+        expression_editor_frame(st.session_state.loads_df, ["Fx", "Fy"]), key="tabla_cargas", num_rows="dynamic", width="stretch",
+        column_config={
+            "Fx": st.column_config.TextColumn(f"Fx ({st.session_state.force_unit})", help=EXPRESSION_HELP),
+            "Fy": st.column_config.TextColumn(f"Fy ({st.session_state.force_unit})", help=EXPRESSION_HELP),
+        },
+        on_change=sync_editor_dataframe, args=("tabla_cargas", "loads_df"),
     )
     st.subheader("Cargas distribuidas axiales")
     st.caption(
@@ -242,12 +399,14 @@ def render_data_editors() -> None:
         "El modelo de armadura no admite cargas transversales ni momentos de extremo."
     )
     st.session_state.distributed_loads_df = st.data_editor(
-        st.session_state.distributed_loads_df,
-        key="distributed_loads_editor", num_rows="dynamic", width="stretch",
+        expression_editor_frame(st.session_state.distributed_loads_df, ["q_i", "q_j"]),
+        key="tabla_cargas_distribuidas", num_rows="dynamic", width="stretch",
         column_config={
             "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Axial"], required=True),
+            "q_i": st.column_config.TextColumn(f"q_i ({st.session_state.force_unit}/{st.session_state.length_unit})", help=EXPRESSION_HELP),
+            "q_j": st.column_config.TextColumn(f"q_j ({st.session_state.force_unit}/{st.session_state.length_unit})", help=EXPRESSION_HELP),
         },
-        on_change=mark_structure_changed,
+        on_change=sync_editor_dataframe, args=("tabla_cargas_distribuidas", "distributed_loads_df"),
     )
 
 
@@ -266,7 +425,7 @@ def render_structure_plot() -> None:
             selected_node = int(customdata[0] if isinstance(customdata, (list, tuple)) else customdata)
             break
 
-    node_ids = set(pd.to_numeric(st.session_state.nodes_df["Nodo"], errors="coerce").dropna().astype(int))
+    node_ids = set(numeric_columns_for_display(st.session_state.nodes_df, ["Nodo"]) ["Nodo"].dropna().astype(int))
     if selected_node in node_ids:
         st.session_state.selected_graph_node = selected_node
     elif st.session_state.get("selected_graph_node") not in node_ids:
@@ -294,6 +453,221 @@ def render_structure_plot() -> None:
         )
 
 
+def solution_plot_base(title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_white", title=title,
+        xaxis_title=f"X ({st.session_state.length_unit})",
+        yaxis_title=f"Y ({st.session_state.length_unit})",
+        margin=dict(l=20, r=20, t=45, b=20),
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1, showgrid=True, zeroline=True)
+    fig.update_xaxes(showgrid=True, zeroline=True)
+    return fig
+
+
+def solver_node_coordinates(solver: Truss2D) -> dict[int, tuple[float, float]]:
+    length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
+    return {node.id: (node.x / length_factor, node.y / length_factor) for node in solver.nodes}
+
+
+def build_element_detail_figure(solver: Truss2D, element: Any, result: dict[str, Any]) -> go.Figure:
+    coordinates = solver_node_coordinates(solver)
+    x_i, y_i = coordinates[element.node_i]
+    x_j, y_j = coordinates[element.node_j]
+    span = max(abs(x_j - x_i), abs(y_j - y_i), result["Longitud"] / LENGTH_TO_METERS[st.session_state.length_unit], 1.0)
+    arrow_size = span * 0.12
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=[x_i, x_j], y=[y_i, y_j], mode="lines+markers+text",
+        line=dict(color="#263746", width=5), marker=dict(size=12, color="#263746"),
+        text=[f"N{element.node_i} (I)", f"N{element.node_j} (J)"],
+        textposition="bottom center", textfont=dict(size=12, color="#263746"),
+        hoverinfo="skip", showlegend=False,
+    ))
+    for node_id, (x, y) in ((element.node_i, (x_i, y_i)), (element.node_j, (x_j, y_j))):
+        dof_x, dof_y = solver.node_dof_indices(node_id)
+        for dx, dy, label in (
+            (arrow_size, 0, f"g{dof_x + 1} · +X"),
+            (0, arrow_size, f"g{dof_y + 1} · +Y"),
+        ):
+            fig.add_annotation(
+                x=x + dx, y=y + dy, ax=x, ay=y, xref="x", yref="y", axref="x", ayref="y",
+                text=label, showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5,
+                arrowcolor="#52705e", font=dict(size=9, color="#40564a"), bgcolor="white",
+            )
+    midpoint_x, midpoint_y = (x_i + x_j) / 2, (y_i + y_j) / 2
+    c, s = result["c"], result["s"]
+    local_arrow_length = span * 0.18
+    fig.add_annotation(
+        x=midpoint_x + c * local_arrow_length, y=midpoint_y + s * local_arrow_length,
+        ax=midpoint_x, ay=midpoint_y, xref="x", yref="y", axref="x", ayref="y",
+        text="+x_l", showarrow=True, arrowhead=3, arrowsize=1.1, arrowwidth=2,
+        arrowcolor="#bd5b2a", font=dict(size=10, color="#9c4823"), bgcolor="white",
+    )
+    padding = span * 0.38
+    fig.update_layout(
+        title=f"Esquema de la barra {element.id} · φ = {np.degrees(result['phi']):.2f}°",
+        template="plotly_white", height=250, showlegend=False,
+        margin=dict(l=35, r=35, t=45, b=45),
+        xaxis=dict(visible=False, range=[min(x_i, x_j) - padding, max(x_i, x_j) + padding]),
+        yaxis=dict(visible=False, range=[min(y_i, y_j) - padding, max(y_i, y_j) + padding], scaleanchor="x", scaleratio=1),
+    )
+    return fig
+
+
+def add_structure_members(fig: go.Figure, solver: Truss2D, coordinates: dict[int, tuple[float, float]], **style: Any) -> None:
+    for element in solver.elements:
+        xi, yi = coordinates[element.node_i]
+        xj, yj = coordinates[element.node_j]
+        fig.add_trace(go.Scatter(
+            x=[xi, xj], y=[yi, yj], mode="lines",
+            hoverinfo="skip", showlegend=False, **style,
+        ))
+
+
+def build_reactions_figure(solver: Truss2D) -> go.Figure:
+    fig = solution_plot_base("Reacciones nodales")
+    coordinates = solver_node_coordinates(solver)
+    add_structure_members(fig, solver, coordinates, line=dict(color="#64748b", width=2))
+    force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
+    reaction_by_dof = dict(zip(solver.restrained_dofs, solver.reactions))
+    max_reaction = max((abs(value) for value in solver.reactions), default=0.0)
+    span = max(
+        max(x for x, _ in coordinates.values()) - min(x for x, _ in coordinates.values()),
+        max(y for _, y in coordinates.values()) - min(y for _, y in coordinates.values()),
+        1.0,
+    )
+    arrow_scale = span * 0.14 / max(max_reaction, 1.0)
+    for node_id, (x, y) in coordinates.items():
+        dof_x, dof_y = solver.node_dof_indices(node_id)
+        rx = float(reaction_by_dof.get(dof_x, 0.0))
+        ry = float(reaction_by_dof.get(dof_y, 0.0))
+        magnitude = float(np.hypot(rx, ry))
+        if magnitude <= 1e-10:
+            continue
+        dx, dy = rx * arrow_scale, ry * arrow_scale
+        fig.add_annotation(
+            x=x + dx, y=y + dy, ax=x, ay=y, xref="x", yref="y", axref="x", ayref="y",
+            text="", showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=2.5,
+            arrowcolor="#dc2626",
+        )
+        fig.add_annotation(
+            x=x + dx * 1.2, y=y + dy * 1.2,
+            text=f"R{node_id} = {format_number(magnitude / force_factor)} {st.session_state.force_unit}",
+            showarrow=False, font=dict(color="#b91c1c", size=11), bgcolor="white",
+        )
+    fig.add_trace(go.Scatter(
+        x=[point[0] for point in coordinates.values()],
+        y=[point[1] for point in coordinates.values()], mode="markers+text",
+        text=[str(node_id) for node_id in coordinates], textposition="top center",
+        marker=dict(size=9, color="#334155"), name="Nodos",
+    ))
+    return fig
+
+
+def build_axial_forces_figure(solver: Truss2D) -> go.Figure:
+    fig = solution_plot_base("Esfuerzo axial por barra")
+    coordinates = solver_node_coordinates(solver)
+    force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
+    results = solver.calculate_axial_forces()
+    for result in results:
+        element = next(item for item in solver.elements if item.id == result["Barra"])
+        xi, yi = coordinates[element.node_i]
+        xj, yj = coordinates[element.node_j]
+        force = float(result["N"])
+        color = "#2563eb" if force > 1e-9 else "#dc2626" if force < -1e-9 else "#64748b"
+        fig.add_trace(go.Scatter(
+            x=[xi, xj], y=[yi, yj], mode="lines",
+            line=dict(color=color, width=5), name=f"Barra {element.id}: {result['estado']}",
+            hovertemplate=f"Barra {element.id}<br>N={format_number(force / force_factor, signed=True)} {st.session_state.force_unit}<extra></extra>",
+        ))
+        fig.add_annotation(
+            x=(xi + xj) / 2, y=(yi + yj) / 2,
+            text=f"{format_number(force / force_factor, signed=True)} {st.session_state.force_unit}",
+            showarrow=False, font=dict(color=color, size=11), bgcolor="white",
+        )
+    fig.add_trace(go.Scatter(
+        x=[point[0] for point in coordinates.values()],
+        y=[point[1] for point in coordinates.values()], mode="markers+text",
+        text=[str(node_id) for node_id in coordinates], textposition="top center",
+        marker=dict(size=8, color="#334155"), name="Nodos",
+    ))
+    return fig
+
+
+def build_deformed_figure(solver: Truss2D, scale: int) -> go.Figure:
+    fig = solution_plot_base(f"Deformada · escala {scale}×")
+    original = solver_node_coordinates(solver)
+    length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
+    deformed = {}
+    for node in solver.nodes:
+        dof_x, dof_y = solver.node_dof_indices(node.id)
+        deformed[node.id] = (
+            node.x / length_factor + solver.displacements[dof_x] / length_factor * scale,
+            node.y / length_factor + solver.displacements[dof_y] / length_factor * scale,
+        )
+    add_structure_members(fig, solver, original, line=dict(color="#94a3b8", width=2, dash="dot"))
+    add_structure_members(fig, solver, deformed, line=dict(color="#0f766e", width=3))
+    for coordinates, name, color in ((original, "Original", "#94a3b8"), (deformed, "Deformada", "#0f766e")):
+        fig.add_trace(go.Scatter(
+            x=[point[0] for point in coordinates.values()],
+            y=[point[1] for point in coordinates.values()], mode="markers+text",
+            text=[str(node_id) for node_id in coordinates], textposition="top center",
+            marker=dict(size=8, color=color), name=name,
+        ))
+    return fig
+
+
+def styled_matrix(
+    matrix: Any,
+    row_labels: list[str],
+    column_labels: list[str],
+) -> pd.io.formats.style.Styler:
+    frame = pd.DataFrame(matrix, index=row_labels, columns=column_labels)
+    styler = frame.style.format(format_number, na_rep="—")
+    return styler.set_table_styles([
+        {"selector": "th", "props": [("font-weight", "bold"), ("border", "1px solid #333333")]},
+        {"selector": "td", "props": [("border", "1px solid #333333"), ("text-align", "right")]},
+    ])
+
+
+def report_payload() -> dict[str, Any]:
+    solver = st.session_state.solution
+    force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
+    length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
+    reactions_by_dof = dict(zip(solver.restrained_dofs, solver.reactions))
+    reactions = []
+    for node in solver.nodes:
+        dof_x, dof_y = solver.node_dof_indices(node.id)
+        reactions.append({
+            "Nodo": node.id,
+            "Rx": float(reactions_by_dof.get(dof_x, 0.0)),
+            "Ry": float(reactions_by_dof.get(dof_y, 0.0)),
+        })
+    return {
+        "name": st.session_state.structure_name_input,
+        "force_unit": st.session_state.force_unit,
+        "length_unit": st.session_state.length_unit,
+        "force_factor": force_factor,
+        "length_factor": length_factor,
+        "nodes": st.session_state.nodes_df.to_dict("records"),
+        "elements": st.session_state.elements_df.to_dict("records"),
+        "supports": st.session_state.supports_df.to_dict("records"),
+        "loads": st.session_state.loads_df.to_dict("records"),
+        "distributed_loads": st.session_state.distributed_loads_df.to_dict("records"),
+        "K_global": solver.global_stiffness,
+        "F_global": solver.global_load_vector(),
+        "displacements": solver.displacements,
+        "reactions": reactions,
+        "axial_forces": solver.calculate_axial_forces(),
+        "partition": solver.partition,
+        "free_dofs": solver.free_dofs,
+        "restrained_dofs": solver.restrained_dofs,
+        "validation": st.session_state.validation,
+    }
+
+
 def render_solution() -> None:
     solver = st.session_state.solution
     if solver is None:
@@ -303,26 +677,77 @@ def render_solution() -> None:
     force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
     length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
     st.caption(f"Desplazamientos en {st.session_state.length_unit}; fuerzas en {st.session_state.force_unit}; matrices y solución interna en SI.")
-    st.write("Desplazamientos")
-    st.dataframe(pd.DataFrame({
-        "GDL": np.arange(1, len(solver.displacements) + 1),
-        f"Desplazamiento ({st.session_state.length_unit})": solver.displacements / length_factor,
-    }), width="stretch")
-    st.write("Reacciones")
-    st.dataframe(pd.DataFrame({
-        "GDL restringido": solver.restrained_dofs + 1,
-        f"Reacción ({st.session_state.force_unit})": solver.reactions / force_factor,
-    }), width="stretch")
-    st.write("Fuerzas axiales")
     axial_results = solver.calculate_axial_forces()
-    st.dataframe(pd.DataFrame([{
-        "Barra": result["Barra"],
-        f"Longitud ({st.session_state.length_unit})": result["Longitud"] / length_factor,
-        f"Fuerza axial ({st.session_state.force_unit})": result["N"] / force_factor,
-        f"N_i ({st.session_state.force_unit})": result["N_i"] / force_factor,
-        f"N_j ({st.session_state.force_unit})": result["N_j"] / force_factor,
-        "Estado": result["estado"],
-    } for result in axial_results]), width="stretch")
+    st.markdown("### 5. Desplazamientos y reacciones")
+    displacement_rows = []
+    reaction_rows = []
+    for node in solver.nodes:
+        dof_x, dof_y = solver.node_dof_indices(node.id)
+        displacement_rows.append({
+            "Nodo": node.id,
+            f"Dx ({st.session_state.length_unit})": solver.displacements[dof_x] / length_factor,
+            f"Dy ({st.session_state.length_unit})": solver.displacements[dof_y] / length_factor,
+        })
+        reaction_rows.append({
+            "Nodo": node.id,
+            f"Rx ({st.session_state.force_unit})": next((value for dof, value in zip(solver.restrained_dofs, solver.reactions) if dof == dof_x), 0.0) / force_factor,
+            f"Ry ({st.session_state.force_unit})": next((value for dof, value in zip(solver.restrained_dofs, solver.reactions) if dof == dof_y), 0.0) / force_factor,
+        })
+    st.write("Desplazamientos nodales")
+    st.dataframe(format_dataframe(pd.DataFrame(displacement_rows)), width="stretch")
+    extreme_displacements = []
+    for node, row in zip(solver.nodes, displacement_rows):
+        for axis, column in (("x", f"Dx ({st.session_state.length_unit})"), ("y", f"Dy ({st.session_state.length_unit})")):
+            value = float(row[column])
+            if 0 < abs(value) < 1e-3 or abs(value) >= 1e5:
+                extreme_displacements.append((node.id, axis, value))
+    for node_id, axis, value in extreme_displacements:
+        st.latex(
+            rf"D_{{N{node_id},{axis}}} = {format_number(value, latex=True)}\;"
+            rf"\mathrm{{{st.session_state.length_unit}}}"
+        )
+    st.write("Reacciones por apoyo")
+    st.dataframe(format_dataframe(pd.DataFrame(reaction_rows)), width="stretch")
+
+    total_rx = sum(row[f"Rx ({st.session_state.force_unit})"] for row in reaction_rows)
+    total_ry = sum(row[f"Ry ({st.session_state.force_unit})"] for row in reaction_rows)
+    external_loads = solver.global_load_vector()
+    total_fx = float(np.sum(external_loads[0::2])) / force_factor
+    total_fy = float(np.sum(external_loads[1::2])) / force_factor
+    residual = float(np.hypot(total_rx + total_fx, total_ry + total_fy))
+    st.info(
+        f"Reacción total: ΣRx = {format_number(total_rx)} {st.session_state.force_unit}; "
+        f"ΣRy = {format_number(total_ry)} {st.session_state.force_unit}; "
+        f"resultante = {format_number(np.hypot(total_rx, total_ry))} {st.session_state.force_unit}."
+    )
+    if residual <= max(1e-6, 1e-6 * float(np.hypot(total_fx, total_fy))):
+        st.success("Equilibrio global verificado: la suma de reacciones y cargas es prácticamente cero.")
+    else:
+        st.warning(f"Desequilibrio global residual: {format_number(residual)} {st.session_state.force_unit}.")
+
+    st.markdown("### 6. Fuerzas axiales internas por barra")
+    element_by_id = {int(row["Barra"]): row for row in st.session_state.elements_df.to_dict("records") if pd.notna(row.get("Barra"))}
+    axial_table = []
+    for result in axial_results:
+        element = element_by_id[result["Barra"]]
+        axial_table.append({
+            "Barra": result["Barra"],
+            "Nodos": f"N{element['Nodo_i']}–N{element['Nodo_j']}",
+            f"N ({st.session_state.force_unit})": result["N"] / force_factor,
+            "Clasificación": result["estado"],
+        })
+    st.dataframe(format_dataframe(pd.DataFrame(axial_table), [f"N ({st.session_state.force_unit})"]), width="stretch")
+
+    reaction_column, axial_column = st.columns(2)
+    with reaction_column:
+        st.plotly_chart(build_reactions_figure(solver), width="stretch")
+    with axial_column:
+        st.plotly_chart(build_axial_forces_figure(solver), width="stretch")
+    deformation_scale = st.slider(
+        "Factor de escala de deformación", min_value=1, max_value=1000, value=100,
+        key="deformation_scale",
+    )
+    st.plotly_chart(build_deformed_figure(solver, deformation_scale), width="stretch")
 
 
 def render_detailed_development() -> None:
@@ -333,8 +758,10 @@ def render_detailed_development() -> None:
 
     force_factor = FORCE_TO_NEWTONS[st.session_state.force_unit]
     length_factor = LENGTH_TO_METERS[st.session_state.length_unit]
-    dof_labels = [f"d{index + 1}" for index in range(len(solver.displacements))]
+    dof_labels = [f"g{index + 1}" for index in range(len(solver.displacements))]
     free_dofs = set(solver.free_dofs.tolist())
+    axial_results = solver.calculate_axial_forces()
+    axial_results_by_id = {result["Barra"]: result for result in axial_results}
 
     st.subheader("Desarrollo Detallado Paso a Paso")
     st.caption("Geometría y propiedades en las unidades de entrada; matrices y vector global en SI.")
@@ -351,74 +778,86 @@ def render_detailed_development() -> None:
             "GDL Y": dof_labels[dof_y],
             "Estado Y": "Libre" if dof_y in free_dofs else "Restringido",
         })
-    st.dataframe(pd.DataFrame(dof_rows), width="stretch")
+    st.dataframe(format_dataframe(pd.DataFrame(dof_rows)), width="stretch")
 
     st.markdown("### Paso 2: Análisis barra por barra")
     ui_elements = st.session_state.elements_df.set_index("Barra", drop=False)
     distributed_loads = st.session_state.distributed_loads_df
     for element in solver.elements:
-        node_i = next(node for node in solver.nodes if node.id == element.node_i)
-        node_j = next(node for node in solver.nodes if node.id == element.node_j)
         c, s = solver.element_direction_cosines(element)
         length = solver.element_length(element)
-        theta = float(np.degrees(np.arctan2(s, c)))
+        bar_result = axial_results_by_id[element.id]
+        phi = bar_result["phi"]
         input_row = ui_elements.loc[element.id]
         if isinstance(input_row, pd.DataFrame):
             input_row = input_row.iloc[0]
-        st.markdown(f"**Barra {element.id}: nodo {element.node_i} → nodo {element.node_j}**")
-        st.write({
-            f"(x1, y1) [{st.session_state.length_unit}]": (node_i.x / length_factor, node_i.y / length_factor),
-            f"(x2, y2) [{st.session_state.length_unit}]": (node_j.x / length_factor, node_j.y / length_factor),
-            f"L [{st.session_state.length_unit}]": length / length_factor,
-            f"A [{st.session_state.length_unit}²]": float(input_row["A"]),
-            f"E [{st.session_state.force_unit}/{st.session_state.length_unit}²]": float(input_row["E"]),
-            "θ [°]": theta,
-            "cos θ": c,
-            "sin θ": s,
-        })
-        st.write("Matriz de rigidez local 4 × 4 (coordenadas de la barra)")
-        st.dataframe(pd.DataFrame(
-            solver.element_stiffness_local_4x4(element),
-            index=[f"d{element.node_i}x", f"d{element.node_i}y", f"d{element.node_j}x", f"d{element.node_j}y"],
-            columns=[f"d{element.node_i}x", f"d{element.node_i}y", f"d{element.node_j}x", f"d{element.node_j}y"],
-        ), width="stretch")
-        st.write("Matriz de rigidez global 4 × 4 (coordenadas de la estructura)")
-        st.dataframe(pd.DataFrame(
-            solver.element_stiffness_global(element),
-            index=[f"d{element.node_i}x", f"d{element.node_i}y", f"d{element.node_j}x", f"d{element.node_j}y"],
-            columns=[f"d{element.node_i}x", f"d{element.node_i}y", f"d{element.node_j}x", f"d{element.node_j}y"],
-        ), width="stretch")
-        member_load_rows = distributed_loads[distributed_loads["Barra"] == element.id]
-        member_loads = [load for load in solver.distributed_loads if load.element_id == element.id]
-        for ((_, load_row), member_load) in zip(member_load_rows.iterrows(), member_loads):
-            st.write(
-                f"Carga distribuida axial: q_i={float(load_row['q_i']):g}, "
-                f"q_j={float(load_row['q_j']):g} {st.session_state.force_unit}/{st.session_state.length_unit}"
+        with st.expander(f"Barra {element.id} · N{element.node_i} → N{element.node_j} · φ = {np.degrees(phi):.2f}°", expanded=False):
+            member_length = length / length_factor
+            member_area = parse_numeric_expression(input_row["A"])
+            member_modulus = parse_numeric_expression(input_row["E"])
+            axial_rigidity = element.E * element.A / length / (force_factor / length_factor)
+            property_columns = st.columns(5)
+            for column, label, value in zip(
+                property_columns,
+                ("Longitud", "Ángulo φ", "Área A", "Módulo E", "Rigidez AE/L"),
+                (
+                    f"{format_number(member_length)} {st.session_state.length_unit}",
+                    f"{format_number(np.degrees(phi))}°",
+                    f"{format_number(member_area)} {st.session_state.length_unit}²",
+                    f"{format_number(member_modulus)} {st.session_state.force_unit}/{st.session_state.length_unit}²",
+                    f"{format_number(axial_rigidity)} {st.session_state.force_unit}/{st.session_state.length_unit}",
+                ),
+            ):
+                with column:
+                    st.metric(label, value)
+            if abs(member_modulus) < 1e-3 or abs(member_modulus) >= 1e5:
+                st.latex(
+                    rf"E = {format_number(member_modulus, latex=True)}\;"
+                    rf"\mathrm{{{st.session_state.force_unit}/{st.session_state.length_unit}^2}}"
+                )
+            st.caption(f"cos φ = {format_number(c)} · sen φ = {format_number(s)}")
+            st.plotly_chart(
+                build_element_detail_figure(solver, element, bar_result),
+                width="stretch", config={"displayModeBar": False},
+                key=f"member_geometry_{element.id}",
             )
-            equivalent_local = solver.element_distributed_load_local(member_load) / force_factor
-            equivalent_global = solver.element_distributed_load_global(member_load) / force_factor
-            st.write("Fuerzas nodales equivalentes locales, en fuerza de entrada:")
-            st.write(equivalent_local)
-            st.write("Fuerzas nodales equivalentes globales, en fuerza de entrada:")
-            st.write(equivalent_global)
+
+            local_dofs = [f"u{element.node_i}'", f"v{element.node_i}'", f"u{element.node_j}'", f"v{element.node_j}'"]
+            global_dofs = [f"g{index + 1}" for index in (
+                *solver.node_dof_indices(element.node_i), *solver.node_dof_indices(element.node_j),
+            )]
+            st.caption("Secuencia matricial: [T]ᵀ × [k_l] × [T] = [K_g]")
+            st.latex(r"[K_g]=[T]^T[k_l][T]")
+            matrix_columns = st.columns(4)
+            matrix_items = (
+                ("[T]ᵀ", bar_result["Tg"].T, global_dofs, local_dofs),
+                ("[k_l] (N/m)", bar_result["KL"], local_dofs, local_dofs),
+                ("[T]", bar_result["Tg"], local_dofs, global_dofs),
+                ("[K_g] (N/m)", bar_result["Kg"], global_dofs, global_dofs),
+            )
+            for column, (label, matrix, row_labels, column_labels) in zip(matrix_columns, matrix_items):
+                with column:
+                    st.caption(label)
+                    st.dataframe(styled_matrix(matrix, row_labels, column_labels), width="stretch")
+
+            member_load_rows = distributed_loads[distributed_loads["Barra"] == element.id]
+            member_loads = [load for load in solver.distributed_loads if load.element_id == element.id]
+            for ((_, load_row), member_load) in zip(member_load_rows.iterrows(), member_loads):
+                st.caption(
+                    f"Carga axial distribuida: q_i={format_number(load_row['q_i'])}, "
+                    f"q_j={format_number(load_row['q_j'])} {st.session_state.force_unit}/{st.session_state.length_unit}"
+                )
+                equivalent_local = solver.element_distributed_load_local(member_load) / force_factor
+                equivalent_global = solver.element_distributed_load_global(member_load) / force_factor
+                st.write("Cargas nodales equivalentes locales")
+                st.dataframe(format_dataframe(pd.DataFrame({"GDL local": local_dofs, f"Carga ({st.session_state.force_unit})": equivalent_local})), width="stretch")
+                st.caption("Para q uniforme, la carga equivalente axial por extremo es q·L/2.")
+                st.write("Cargas nodales equivalentes globales")
+                st.dataframe(format_dataframe(pd.DataFrame({"GDL global": global_dofs, f"Carga ({st.session_state.force_unit})": equivalent_global})), width="stretch")
 
     st.markdown("### Paso 3: Ensamble y partición de la matriz global")
-    st.write("Aportes de cada barra: K_global[I_i, I_j] += K_elemento[i, j]")
-    assembly_rows = []
-    for element in solver.elements:
-        element_dofs = [*solver.node_dof_indices(element.node_i), *solver.node_dof_indices(element.node_j)]
-        element_matrix = solver.element_stiffness_global(element)
-        for local_i, global_i in enumerate(element_dofs):
-            for local_j, global_j in enumerate(element_dofs):
-                assembly_rows.append({
-                    "Barra": element.id,
-                    "Fila global": dof_labels[global_i],
-                    "Columna global": dof_labels[global_j],
-                    "Aporte [N/m]": element_matrix[local_i, local_j],
-                })
-    st.dataframe(pd.DataFrame(assembly_rows), width="stretch")
-    st.write("K_global [N/m]")
-    st.dataframe(pd.DataFrame(solver.global_stiffness, index=dof_labels, columns=dof_labels), width="stretch")
+    st.caption("Matriz ensamblada en el orden global de grados de libertad g1…gN; unidades SI.")
+    st.dataframe(styled_matrix(solver.global_stiffness, dof_labels, dof_labels), width="stretch")
     st.write("Bloques según GDL libres (L) y restringidos (R)")
     block_columns = st.columns(2)
     for column, key, row_ids, col_ids in (
@@ -428,37 +867,96 @@ def render_detailed_development() -> None:
         (block_columns[1], "K_RR", solver.restrained_dofs, solver.restrained_dofs),
     ):
         with column:
-            st.write(key)
-            st.dataframe(pd.DataFrame(
-                solver.partition[key],
-                index=[dof_labels[index] for index in row_ids],
-                columns=[dof_labels[index] for index in col_ids],
-            ), width="stretch")
+            st.write(f"Submatriz [{key}]")
+            row_labels = [dof_labels[index] for index in row_ids]
+            column_labels = [dof_labels[index] for index in col_ids]
+            st.dataframe(styled_matrix(solver.partition[key], row_labels, column_labels), width="stretch")
+    st.write("Inversa de la submatriz libre-libre [K_LL]⁻¹ [m/N]")
+    inverse_k_ll = np.linalg.inv(solver.partition["K_LL"])
+    free_labels = [dof_labels[index] for index in solver.free_dofs]
+    st.dataframe(styled_matrix(inverse_k_ll, free_labels, free_labels), width="stretch")
 
     st.markdown("### Paso 4: Vector P y solución")
     load_vector = solver.global_load_vector()
     st.write("P_global: cargas nodales más fuerzas equivalentes distribuidas [N]")
-    st.dataframe(pd.DataFrame({"GDL": dof_labels, "P [N]": load_vector}), width="stretch")
+    st.dataframe(format_dataframe(pd.DataFrame({"GDL": dof_labels, "P [N]": load_vector})), width="stretch")
     st.latex(r"K_{LL}D_L=P_L-K_{LR}D_R")
-    st.write({
-        "GDL libres": [dof_labels[index] for index in solver.free_dofs],
-        "P_L [N]": solver.partition["F_L"],
-        "D_L [m]": solver.displacements[solver.free_dofs],
-        "GDL restringidos": [dof_labels[index] for index in solver.restrained_dofs],
-        "D_R [m]": solver.displacements[solver.restrained_dofs],
+    st.latex(r"D_L=K_{LL}^{-1}(P_L-K_{LR}D_R);\quad D_R=0\Rightarrow D_L=K_{LL}^{-1}P_L")
+    free_solution = pd.DataFrame({
+        "GDL libre": [dof_labels[index] for index in solver.free_dofs],
+        "P_L (N)": solver.partition["F_L"],
+        "D_L (m)": solver.displacements[solver.free_dofs],
     })
-    st.write("Fuerzas axiales de extremo por barra")
-    st.dataframe(pd.DataFrame([{
+    st.dataframe(format_dataframe(free_solution), width="stretch")
+    restrained_solution = pd.DataFrame({
+        "GDL restringido": [dof_labels[index] for index in solver.restrained_dofs],
+        "P_R (N)": solver.partition["F_R"],
+        "D_R (m)": solver.displacements[solver.restrained_dofs],
+    })
+    st.dataframe(format_dataframe(restrained_solution), width="stretch")
+    st.write("Reacciones en GDL restringidos")
+    st.latex(r"F_{RR}=K_{RL}D_L+K_{RR}D_R-P_R;\quad D_R=0,\ P_R=0\Rightarrow F_{RR}=K_{RL}D_L")
+    st.dataframe(format_dataframe(pd.DataFrame({
+        "GDL": [dof_labels[index] for index in solver.restrained_dofs],
+        f"Reacción ({st.session_state.force_unit})": solver.reactions / force_factor,
+    })), width="stretch")
+
+    st.markdown("### Paso 5: Cálculo de fuerzas internas por barra")
+    st.dataframe(format_dataframe(pd.DataFrame([{
         "Barra": result["Barra"],
         f"N_i ({st.session_state.force_unit})": result["N_i"] / force_factor,
         f"N_j ({st.session_state.force_unit})": result["N_j"] / force_factor,
-        "Estado": result["estado"],
-    } for result in solver.calculate_axial_forces()]), width="stretch")
-    st.write("Reacciones en GDL restringidos")
-    st.dataframe(pd.DataFrame({
-        "GDL": [dof_labels[index] for index in solver.restrained_dofs],
-        f"Reacción ({st.session_state.force_unit})": solver.reactions / force_factor,
-    }), width="stretch")
+        "Clasificación": result["estado"],
+    } for result in axial_results]), [
+        f"N_i ({st.session_state.force_unit})", f"N_j ({st.session_state.force_unit})",
+    ]), width="stretch")
+    for element in solver.elements:
+        bar_result = axial_results_by_id[element.id]
+        local_dofs = [f"u{element.node_i}'", f"v{element.node_i}'", f"u{element.node_j}'", f"v{element.node_j}'"]
+        global_indices = [*solver.node_dof_indices(element.node_i), *solver.node_dof_indices(element.node_j)]
+        global_dofs = [dof_labels[index] for index in global_indices]
+        with st.expander(
+            f"Barra {element.id} · N{element.node_i} → N{element.node_j} · {bar_result['estado']}",
+            expanded=element.id == solver.elements[0].id,
+        ):
+            st.plotly_chart(
+                build_element_detail_figure(solver, element, bar_result),
+                width="stretch", config={"displayModeBar": False},
+                key=f"member_forces_{element.id}",
+            )
+            st.latex(r"\{d_l\}=[T]\{d_g\};\quad \{f_L\}=[k_l]\{d_l\}")
+            st.caption("Desplazamientos globales del elemento {d_g} (m)")
+            st.dataframe(format_dataframe(pd.DataFrame({
+                "GDL global": global_dofs,
+                "Desplazamiento global d_g (m)": bar_result["De"],
+            })), width="stretch")
+            st.caption("Matriz de transformación [T]")
+            st.dataframe(styled_matrix(bar_result["Tg"], local_dofs, global_dofs), width="stretch")
+            st.caption("Desplazamientos locales {d_l} = [T]{d_g} (m)")
+            st.dataframe(format_dataframe(pd.DataFrame({
+                "GDL local": local_dofs,
+                "Desplazamiento local d_l (m)": bar_result["d_local"],
+            })), width="stretch")
+            st.caption("Matriz de rigidez local [k_l] (N/m)")
+            st.dataframe(styled_matrix(bar_result["KL"], local_dofs, local_dofs), width="stretch")
+            st.caption("Vector de fuerzas elásticas {f_L} = [k_l]{d_l} (N)")
+            st.dataframe(format_dataframe(pd.DataFrame({
+                "GDL local": local_dofs,
+                "Fuerza elástica f_L (N)": bar_result["f_L"],
+            }), ["Fuerza elástica f_L (N)"]), width="stretch")
+            force_table = pd.DataFrame({
+                "GDL local": local_dofs,
+                "Desplazamiento local d_l (m)": bar_result["d_local"],
+                "Fuerza elástica f_L (N)": bar_result["f_L"],
+                "Fuerza interna (N)": bar_result["fuerzas_internas_locales"],
+            })
+            st.dataframe(format_dataframe(force_table, ["Fuerza elástica f_L (N)", "Fuerza interna (N)"]), width="stretch")
+            axial_color = "#1d4ed8" if bar_result["N"] >= 0 else "#b91c1c"
+            st.markdown(
+                f"Fuerza axial **N = {format_number(bar_result['N'] / force_factor, signed=True)} {st.session_state.force_unit}** "
+                f"· <span style='color:{axial_color};font-weight:700'>{bar_result['estado']}</span>",
+                unsafe_allow_html=True,
+            )
 
 
 def build_structure_figure() -> go.Figure:
@@ -487,9 +985,7 @@ def build_structure_figure() -> go.Figure:
         return fig
 
     nodes_df = nodes_df.copy()
-    nodes_df["Nodo"] = pd.to_numeric(nodes_df["Nodo"], errors="coerce")
-    nodes_df["X"] = pd.to_numeric(nodes_df["X"], errors="coerce")
-    nodes_df["Y"] = pd.to_numeric(nodes_df["Y"], errors="coerce")
+    nodes_df = numeric_columns_for_display(nodes_df, ["Nodo", "X", "Y"])
     nodes_df = nodes_df.dropna(subset=["Nodo", "X", "Y"]).copy()
 
     if nodes_df.empty:
@@ -520,6 +1016,11 @@ def build_structure_figure() -> go.Figure:
                     xi, yi = node_map[i]
                     xj, yj = node_map[j]
                     fig.add_trace(go.Scatter(x=[xi, xj], y=[yi, yj], mode="lines", line=dict(color="#2563eb", width=2), name=f"Barra {row.get('Barra', '')}"))
+                    fig.add_annotation(
+                        x=(xi + xj) / 2, y=(yi + yj) / 2,
+                        text=f"B{format_number(parse_numeric_for_display(row.get('Barra', '')))}",
+                        showarrow=False, font=dict(color="#1e3a5f", size=11), bgcolor="white",
+                    )
             except Exception:
                 continue
 
@@ -567,7 +1068,7 @@ def build_structure_figure() -> go.Figure:
                 fig.add_annotation(
                     x=xi + dx * 0.5 + nx * offset * (1 if q_i + q_j >= 0 else -1) * 2,
                     y=yi + dy * 0.5 + ny * offset * (1 if q_i + q_j >= 0 else -1) * 2,
-                    text=f"q={q_peak:g} {force_unit}/{length_unit}",
+                    text=f"q={format_number(q_peak)} {force_unit}/{length_unit}",
                     showarrow=False, font=dict(color="#b91c1c", size=10), bgcolor="white",
                 )
             except Exception:
@@ -588,11 +1089,11 @@ def build_structure_figure() -> go.Figure:
     for row in nodes_df.itertuples(index=False):
         node_id = int(row.Nodo)
         x0, y0 = node_map[node_id]
-        dof_x = (node_id - 1) * 2 + 1
+        dof_x = 2 * (node_id - 1) + 1
         dof_y = dof_x + 1
         for x_head, y_head, label, color in (
-            (x0 + arrow_x, y0, f"d{dof_x}", "#2563eb"),
-            (x0, y0 + arrow_y, f"d{dof_y}", "#059669"),
+            (x0 + arrow_x, y0, f"g{dof_x} · +X", "#2563eb"),
+            (x0, y0 + arrow_y, f"g{dof_y} · +Y", "#059669"),
         ):
             fig.add_annotation(
                 x=x_head, y=y_head, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
@@ -681,17 +1182,7 @@ with st.sidebar:
     st.divider()
     if st.button("Descargar Excel", width="stretch"):
         if st.session_state.solution is not None:
-            solver = st.session_state.solution
-            results = {
-                "nodes": st.session_state.nodes_df.to_dict("records"),
-                "elements": st.session_state.elements_df.to_dict("records"),
-                "supports": st.session_state.supports_df.to_dict("records"),
-                "loads": st.session_state.loads_df.to_dict("records"),
-                "distributed_loads": st.session_state.distributed_loads_df.to_dict("records"),
-                "K_global": solver.global_stiffness,
-                "F_global": solver.global_load_vector(),
-                "validation": st.session_state.validation,
-            }
+            results = report_payload()
             path = export_analysis_excel(results, "Memoria_Analisis_Estructural.xlsx")
             with open(path, "rb") as file:
                 st.download_button("Descargar archivo Excel", file.read(), file_name="Memoria_Analisis_Estructural.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -700,17 +1191,7 @@ with st.sidebar:
 
     if st.button("Preparar memoria PDF", width="stretch"):
         if st.session_state.solution is not None:
-            solver = st.session_state.solution
-            results = {
-                "nodes": st.session_state.nodes_df.to_dict("records"),
-                "elements": st.session_state.elements_df.to_dict("records"),
-                "supports": st.session_state.supports_df.to_dict("records"),
-                "loads": st.session_state.loads_df.to_dict("records"),
-                "distributed_loads": st.session_state.distributed_loads_df.to_dict("records"),
-                "K_global": solver.global_stiffness,
-                "F_global": solver.global_load_vector(),
-                "validation": st.session_state.validation,
-            }
+            results = report_payload()
             path = generate_pdf_report(results, "Memoria_Analisis_Estructural.pdf")
             with open(path, "rb") as file:
                 st.download_button("Descargar PDF", file.read(), file_name="Memoria_Analisis_Estructural.pdf", mime="application/pdf")
@@ -727,14 +1208,39 @@ if st.session_state.view_mode == "Integrada":
     with data_column:
         render_data_editors()
     with diagram_column:
-        st.subheader("Diagrama interactivo")
-        render_structure_plot()
+        st.subheader("Canvas de edición")
+        render_structure_canvas()
+        with st.expander("Diagrama de resultados", expanded=False):
+            render_structure_plot()
     with st.expander("Resultados del análisis", expanded=st.session_state.solution is not None):
         render_solution()
     with st.expander("Desarrollo detallado paso a paso"):
         render_detailed_development()
 else:
     tabs = st.tabs(["Nodos", "Barras", "Apoyos", "Cargas", "Solución", "Desarrollo detallado", "Diagrama", "Validación"])
+    text_input_columns = {
+        "nodes_df": {
+            "X": st.column_config.TextColumn("X", help=EXPRESSION_HELP),
+            "Y": st.column_config.TextColumn("Y", help=EXPRESSION_HELP),
+        },
+        "elements_df": {
+            "E": st.column_config.TextColumn("E", help=EXPRESSION_HELP),
+            "A": st.column_config.TextColumn("A", help=EXPRESSION_HELP),
+        },
+        "supports_df": {
+            "Ux": st.column_config.TextColumn("Ux", help=EXPRESSION_HELP),
+            "Uy": st.column_config.TextColumn("Uy", help=EXPRESSION_HELP),
+        },
+        "loads_df": {
+            "Fx": st.column_config.TextColumn("Fx", help=EXPRESSION_HELP),
+            "Fy": st.column_config.TextColumn("Fy", help=EXPRESSION_HELP),
+        },
+        "distributed_loads_df": {
+            "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Axial"], required=True),
+            "q_i": st.column_config.TextColumn("q_i", help=EXPRESSION_HELP),
+            "q_j": st.column_config.TextColumn("q_j", help=EXPRESSION_HELP),
+        },
+    }
     for tab, title, state_key, editor_key in zip(
         tabs[:5],
         ("Tabla de nodos", "Tabla de barras", "Tabla de apoyos", "Tabla de cargas nodales", "Tabla de cargas distribuidas"),
@@ -746,17 +1252,29 @@ else:
             if state_key == "distributed_loads_df":
                 st.caption(f"q en {st.session_state.force_unit}/{st.session_state.length_unit}; solo se admite Tipo = Axial.")
             st.session_state[state_key] = st.data_editor(
-                st.session_state[state_key], key=editor_key, num_rows="dynamic", width="stretch",
-                column_config={"Tipo": st.column_config.SelectboxColumn("Tipo", options=["Axial"], required=True)} if state_key == "distributed_loads_df" else None,
-                on_change=mark_structure_changed,
+                expression_editor_frame(st.session_state[state_key], list(text_input_columns[state_key])), key=editor_key, num_rows="dynamic", width="stretch",
+                column_config=text_input_columns[state_key],
+                on_change=sync_editor_dataframe, args=(editor_key, state_key),
             )
     with tabs[4]:
         render_solution()
     with tabs[5]:
         render_detailed_development()
     with tabs[6]:
-        st.subheader("Diagrama interactivo")
+        st.subheader("Canvas de edición")
+        render_structure_canvas()
+        st.subheader("Diagrama de resultados")
         render_structure_plot()
     with tabs[7]:
-        st.write("Validación del ejercicio:")
-        st.write(st.session_state.validation)
+        validation = st.session_state.validation
+        st.subheader("Validación del ejercicio")
+        message = validation.get("message", "Sin mensaje de validación.")
+        if validation.get("status") == "PASS":
+            st.success(message)
+        else:
+            st.info(message)
+        missing_data = validation.get("missing_data", [])
+        if missing_data:
+            st.markdown("**Datos pendientes para cotejo:**")
+            for item in missing_data:
+                st.markdown(f"- {item}")

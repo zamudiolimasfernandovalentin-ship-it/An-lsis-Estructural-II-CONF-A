@@ -1,9 +1,116 @@
 from __future__ import annotations
 
+import ast
+import math
+import operator
+import re
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Dict, Any
 
 import numpy as np
+
+
+_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPERATORS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def parse_numeric_expression(value: Any) -> float:
+    """Parse a numeric value or a safe arithmetic expression used in model inputs."""
+    if value is None:
+        return float("nan")
+    if isinstance(value, (int, float, np.number)):
+        number = float(value)
+        if np.isnan(number):
+            return number
+        if not np.isfinite(number):
+            raise ValueError("El valor debe ser un número finito.")
+        return number
+
+    expression = str(value).strip()
+    if not expression:
+        return float("nan")
+    if "," in expression and "." not in expression:
+        expression = expression.replace(",", ".")
+    expression = expression.replace("×", "*").replace("√", "sqrt")
+    expression = re.sub(r"raiz\s*\(", "sqrt(", expression, flags=re.IGNORECASE)
+    expression = re.sub(r"(?<=\d)\s*[xX]\s*(?=[+-]?(?:\d|\())", "*", expression)
+    expression = re.sub(r"(?<=\d)\s*(?=sqrt\s*\()", "*", expression, flags=re.IGNORECASE)
+    expression = expression.replace("^", "**")
+    if len(expression) > 256:
+        raise ValueError("La expresión numérica es demasiado larga.")
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+        if sum(1 for _ in ast.walk(tree)) > 64:
+            raise ValueError("La expresión numérica es demasiado compleja.")
+
+        def evaluate(node: ast.AST) -> float:
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                return float(node.value)
+            if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
+                left = evaluate(node.left)
+                right = evaluate(node.right)
+                if isinstance(node.op, ast.Pow) and abs(right) > 1000:
+                    raise ValueError("El exponente debe estar entre -1000 y 1000.")
+                return float(_BINARY_OPERATORS[type(node.op)](left, right))
+            if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPERATORS:
+                return float(_UNARY_OPERATORS[type(node.op)](evaluate(node.operand)))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id.lower() == "sqrt"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                return math.sqrt(evaluate(node.args[0]))
+            raise ValueError("La expresión solo admite +, -, *, /, potencias y sqrt()/raiz().")
+
+        result = evaluate(tree)
+    except (SyntaxError, TypeError, ZeroDivisionError, OverflowError) as exc:
+        raise ValueError(f"Expresión numérica no válida: {value!r}.") from exc
+    if not np.isfinite(result):
+        raise ValueError("El resultado de la expresión debe ser finito.")
+    return float(result)
+
+
+def format_number(value: Any, significant_digits: int = 4, latex: bool = False, signed: bool = False) -> str:
+    """Format a value with significant digits and compact scientific notation at extremes."""
+    number = float(value)
+    if not np.isfinite(number):
+        return "—" if np.isnan(number) else ("∞" if number > 0 else "−∞")
+    if number == 0:
+        return "+0" if signed else "0"
+
+    sign_prefix = "+" if signed and number > 0 else ""
+    def scientific(value_to_format: float) -> str:
+        mantissa, exponent = f"{value_to_format:.{significant_digits - 1}e}".split("e")
+        mantissa = mantissa.rstrip("0").rstrip(".")
+        mantissa = f"{sign_prefix}{mantissa}"
+        if latex:
+            return f"{mantissa} \\times 10^{{{int(exponent)}}}"
+        return f"{mantissa} × 10^{int(exponent)}"
+
+    magnitude = abs(number)
+    if magnitude < 1e-3 or magnitude >= 1e5:
+        return scientific(number)
+
+    order = math.floor(math.log10(magnitude))
+    decimal_places = significant_digits - order - 1
+    rounded = round(number, decimal_places)
+    if 0 < abs(rounded) < 1e-3 or abs(rounded) >= 1e5:
+        return scientific(rounded)
+    text = f"{rounded:.{max(decimal_places, 0)}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{sign_prefix}{text}"
 
 
 @dataclass
@@ -70,7 +177,11 @@ class Truss2D:
             if isinstance(item, Node):
                 coerced.append(item)
             else:
-                coerced.append(Node(id=int(item["Nodo"] if "Nodo" in item else item["node"]), x=float(item["X"] if "X" in item else item["x"]), y=float(item["Y"] if "Y" in item else item["y"])))
+                coerced.append(Node(
+                    id=int(parse_numeric_expression(item["Nodo"] if "Nodo" in item else item["node"])),
+                    x=parse_numeric_expression(item["X"] if "X" in item else item["x"]),
+                    y=parse_numeric_expression(item["Y"] if "Y" in item else item["y"]),
+                ))
         return coerced
 
     def _coerce_elements(self, elements: Iterable[Element] | List[dict]) -> List[Element]:
@@ -79,9 +190,13 @@ class Truss2D:
             if isinstance(item, Element):
                 coerced.append(item)
             else:
-                node_i = int(item["Nodo_i"] if "Nodo_i" in item else item["node_i"])
-                node_j = int(item["Nodo_j"] if "Nodo_j" in item else item["node_j"])
-                coerced.append(Element(id=int(item["Barra"] if "Barra" in item else item["id"]), node_i=node_i, node_j=node_j, E=float(item["E"]), A=float(item["A"])))
+                node_i = int(parse_numeric_expression(item["Nodo_i"] if "Nodo_i" in item else item["node_i"]))
+                node_j = int(parse_numeric_expression(item["Nodo_j"] if "Nodo_j" in item else item["node_j"]))
+                coerced.append(Element(
+                    id=int(parse_numeric_expression(item["Barra"] if "Barra" in item else item["id"])),
+                    node_i=node_i, node_j=node_j,
+                    E=parse_numeric_expression(item["E"]), A=parse_numeric_expression(item["A"]),
+                ))
         return coerced
 
     def _coerce_supports(self, supports: Iterable[Support] | List[dict]) -> List[Support]:
@@ -90,9 +205,9 @@ class Truss2D:
             if isinstance(item, Support):
                 coerced.append(item)
             else:
-                node = int(item["Nodo"] if "Nodo" in item else item["node"])
-                ux = float(item.get("Ux", item.get("ux", 0.0)))
-                uy = float(item.get("Uy", item.get("uy", 0.0)))
+                node = int(parse_numeric_expression(item["Nodo"] if "Nodo" in item else item["node"]))
+                ux = parse_numeric_expression(item.get("Ux", item.get("ux", 0.0)))
+                uy = parse_numeric_expression(item.get("Uy", item.get("uy", 0.0)))
                 coerced.append(Support(node=node, ux=ux, uy=uy))
         return coerced
 
@@ -102,8 +217,12 @@ class Truss2D:
             if isinstance(item, Load):
                 coerced.append(item)
             else:
-                node = int(item["Nodo"] if "Nodo" in item else item["node"])
-                coerced.append(Load(node=node, fx=float(item.get("Fx", item.get("fx", 0.0))), fy=float(item.get("Fy", item.get("fy", 0.0)))))
+                node = int(parse_numeric_expression(item["Nodo"] if "Nodo" in item else item["node"]))
+                coerced.append(Load(
+                    node=node,
+                    fx=parse_numeric_expression(item.get("Fx", item.get("fx", 0.0))),
+                    fy=parse_numeric_expression(item.get("Fy", item.get("fy", 0.0))),
+                ))
         return coerced
 
     def _coerce_distributed_loads(self, loads: Iterable[DistributedLoad] | List[dict]) -> List[DistributedLoad]:
@@ -113,9 +232,9 @@ class Truss2D:
                 coerced.append(item)
             else:
                 coerced.append(DistributedLoad(
-                    element_id=int(item.get("Barra", item.get("element_id"))),
-                    q_i=float(item.get("q_i", item.get("q_inicio", 0.0))),
-                    q_j=float(item.get("q_j", item.get("q_fin", 0.0))),
+                    element_id=int(parse_numeric_expression(item.get("Barra", item.get("element_id")))),
+                    q_i=parse_numeric_expression(item.get("q_i", item.get("q_inicio", 0.0))),
+                    q_j=parse_numeric_expression(item.get("q_j", item.get("q_fin", 0.0))),
                     direction=str(item.get("Tipo", item.get("direction", "Axial"))),
                 ))
         return coerced
@@ -127,21 +246,28 @@ class Truss2D:
         node_ids = [node.id for node in self.nodes]
         if len(node_ids) != len(set(node_ids)):
             raise ValueError("Hay nodos duplicados en la estructura.")
+        for node in self.nodes:
+            if not np.isfinite(node.x) or not np.isfinite(node.y):
+                raise ValueError(f"Las coordenadas del nodo {node.id} deben ser números finitos.")
         for element in self.elements:
             if element.node_i not in node_ids or element.node_j not in node_ids:
                 raise ValueError(f"La barra {element.id} conecta nodos inexistentes.")
-            if element.A <= 0:
+            if not np.isfinite(element.A) or element.A <= 0:
                 raise ValueError(f"La barra {element.id} tiene área A <= 0.")
-            if element.E <= 0:
+            if not np.isfinite(element.E) or element.E <= 0:
                 raise ValueError(f"La barra {element.id} tiene módulo E <= 0.")
             if self.element_length(element) <= 0:
                 raise ValueError(f"La barra {element.id} presenta longitud cero o nula.")
         for support in self.supports:
             if support.node not in node_ids:
                 raise ValueError(f"El apoyo en el nodo {support.node} no existe.")
+            if not np.isfinite(support.ux) or not np.isfinite(support.uy):
+                raise ValueError(f"Los desplazamientos prescritos del apoyo en el nodo {support.node} deben ser finitos.")
         for load in self.loads:
             if load.node not in node_ids:
                 raise ValueError(f"La carga en el nodo {load.node} no existe.")
+            if not np.isfinite(load.fx) or not np.isfinite(load.fy):
+                raise ValueError(f"Las cargas del nodo {load.node} deben ser números finitos.")
         element_ids = {element.id for element in self.elements}
         for load in self.distributed_loads:
             if load.element_id not in element_ids:
@@ -174,6 +300,14 @@ class Truss2D:
         s = dy / L
         return c, s
 
+    def element_transformation_matrix(self, element: Element) -> np.ndarray:
+        c, s = self.element_direction_cosines(element)
+        return np.array(
+            [[c, s, 0.0, 0.0], [-s, c, 0.0, 0.0],
+             [0.0, 0.0, c, s], [0.0, 0.0, -s, c]],
+            dtype=float,
+        )
+
     def element_stiffness_local(self, element: Element) -> np.ndarray:
         L = self.element_length(element)
         k = (element.E * element.A / L) * np.array([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
@@ -203,18 +337,9 @@ class Truss2D:
         return np.array([c * local[0], s * local[0], c * local[2], s * local[2]], dtype=float)
 
     def element_stiffness_global(self, element: Element) -> np.ndarray:
-        c, s = self.element_direction_cosines(element)
-        L = self.element_length(element)
-        factor = (element.E * element.A) / L
-        Ke = factor * np.array(
-            [
-                [c * c, c * s, -c * c, -c * s],
-                [c * s, s * s, -c * s, -s * s],
-                [-c * c, -c * s, c * c, c * s],
-                [-c * s, -s * s, c * s, s * s],
-            ],
-            dtype=float,
-        )
+        transform = self.element_transformation_matrix(element)
+        local_stiffness = self.element_stiffness_local_4x4(element)
+        Ke = transform.T @ local_stiffness @ transform
         if not np.allclose(Ke, Ke.T, atol=1e-10, rtol=1e-8):
             raise ValueError(f"La matriz de rigidez local de la barra {element.id} no es simétrica.")
         return Ke
@@ -302,6 +427,7 @@ class Truss2D:
             "F_R": F_R,
             "D_R": D_R,
             "D_L": None,
+            "F_RR": None,
         }
 
     def solve_displacements(self) -> np.ndarray:
@@ -318,6 +444,7 @@ class Truss2D:
         D_total[self.free_dofs] = D_L
         D_total[self.restrained_dofs] = D_R
         self.displacements = D_total
+        self.partition["D_L"] = D_L
         return D_total
 
     def calculate_reactions(self) -> np.ndarray:
@@ -325,6 +452,7 @@ class Truss2D:
             self.solve_displacements()
         residual = self.global_stiffness @ self.displacements - self.global_load_vector()
         self.reactions = residual[self.restrained_dofs]
+        self.partition["F_RR"] = self.reactions
         return self.reactions
 
     def calculate_axial_forces(self) -> List[dict]:
@@ -333,20 +461,22 @@ class Truss2D:
         results: List[dict] = []
         for element in self.elements:
             c, s = self.element_direction_cosines(element)
+            phi = float(np.arctan2(s, c))
             dof_i = [2 * (element.node_i - 1), 2 * (element.node_i - 1) + 1, 2 * (element.node_j - 1), 2 * (element.node_j - 1) + 1]
             D_e = self.displacements[dof_i]
-            rotation = np.array(
-                [[c, s, 0.0, 0.0], [-s, c, 0.0, 0.0], [0.0, 0.0, c, s], [0.0, 0.0, -s, c]],
-                dtype=float,
-            )
-            local_displacements = rotation @ D_e
+            transform = self.element_transformation_matrix(element)
+            local_stiffness = self.element_stiffness_local_4x4(element)
+            global_stiffness = transform.T @ local_stiffness @ transform
+            local_displacements = transform @ D_e
             delta = local_displacements[2] - local_displacements[0]
-            local_end_forces = self.element_stiffness_local_4x4(element) @ local_displacements
+            local_end_forces = local_stiffness @ local_displacements
             member_loads = [load for load in self.distributed_loads if load.element_id == element.id]
+            equivalent_local_load = np.zeros(4, dtype=float)
             for member_load in member_loads:
-                local_end_forces -= self.element_distributed_load_local(member_load)
-            force_i = -local_end_forces[0]
-            force_j = local_end_forces[2]
+                equivalent_local_load += self.element_distributed_load_local(member_load)
+            internal_end_forces = local_end_forces - equivalent_local_load
+            force_i = -internal_end_forces[0]
+            force_j = internal_end_forces[2]
             N = (force_i + force_j) / 2.0
             if force_i > 1e-9 and force_j > 1e-9:
                 estado = "TRACCIÓN"
@@ -359,10 +489,18 @@ class Truss2D:
             results.append({
                 "Barra": element.id,
                 "Longitud": self.element_length(element),
+                "phi": phi,
                 "c": c,
                 "s": s,
                 "De": D_e,
+                "Tg": transform,
+                "KL": local_stiffness,
+                "Kg": global_stiffness,
                 "delta": delta,
+                "d_local": local_displacements,
+                "f_L": local_end_forces,
+                "carga_equivalente_local": equivalent_local_load,
+                "fuerzas_internas_locales": internal_end_forces,
                 "N": N,
                 "N_i": force_i,
                 "N_j": force_j,
@@ -397,18 +535,18 @@ class Truss2D:
 def parse_supports_from_df(df) -> List[Support]:
     supports = []
     for _, row in df.iterrows():
-        node = int(row["Nodo"])
+        node = int(parse_numeric_expression(row["Nodo"]))
         ux_val = row.get("Ux", 0.0)
         uy_val = row.get("Uy", 0.0)
-        supports.append(Support(node=node, ux=float(ux_val), uy=float(uy_val)))
+        supports.append(Support(node=node, ux=parse_numeric_expression(ux_val), uy=parse_numeric_expression(uy_val)))
     return supports
 
 
 def parse_loads_from_df(df) -> List[Load]:
     loads = []
     for _, row in df.iterrows():
-        node = int(row["Nodo"])
-        loads.append(Load(node=node, fx=float(row.get("Fx", 0.0)), fy=float(row.get("Fy", 0.0))))
+        node = int(parse_numeric_expression(row["Nodo"]))
+        loads.append(Load(node=node, fx=parse_numeric_expression(row.get("Fx", 0.0)), fy=parse_numeric_expression(row.get("Fy", 0.0))))
     return loads
 
 
@@ -416,9 +554,9 @@ def parse_distributed_loads_from_df(df) -> List[DistributedLoad]:
     loads = []
     for _, row in df.iterrows():
         loads.append(DistributedLoad(
-            element_id=int(row["Barra"]),
-            q_i=float(row.get("q_i", 0.0)),
-            q_j=float(row.get("q_j", 0.0)),
+            element_id=int(parse_numeric_expression(row["Barra"])),
+            q_i=parse_numeric_expression(row.get("q_i", 0.0)),
+            q_j=parse_numeric_expression(row.get("q_j", 0.0)),
             direction=str(row.get("Tipo", "Axial")),
         ))
     return loads
@@ -427,14 +565,24 @@ def parse_distributed_loads_from_df(df) -> List[DistributedLoad]:
 def parse_nodes_from_df(df) -> List[Node]:
     nodes = []
     for _, row in df.iterrows():
-        nodes.append(Node(id=int(row["Nodo"]), x=float(row["X"]), y=float(row["Y"])))
+        nodes.append(Node(
+            id=int(parse_numeric_expression(row["Nodo"])),
+            x=parse_numeric_expression(row["X"]),
+            y=parse_numeric_expression(row["Y"]),
+        ))
     return nodes
 
 
 def parse_elements_from_df(df) -> List[Element]:
     elements = []
     for _, row in df.iterrows():
-        elements.append(Element(id=int(row["Barra"]), node_i=int(row["Nodo_i"]), node_j=int(row["Nodo_j"]), E=float(row["E"]), A=float(row["A"])))
+        elements.append(Element(
+            id=int(parse_numeric_expression(row["Barra"])),
+            node_i=int(parse_numeric_expression(row["Nodo_i"])),
+            node_j=int(parse_numeric_expression(row["Nodo_j"])),
+            E=parse_numeric_expression(row["E"]),
+            A=parse_numeric_expression(row["A"]),
+        ))
     return elements
 
 
